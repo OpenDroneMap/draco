@@ -1105,19 +1105,20 @@ else()
   endif()
 
   # Draco app targets.
-  draco_add_executable(
-    NAME draco_decoder
-    SOURCES "${draco_src_root}/tools/draco_decoder.cc" ${draco_io_sources}
-    DEFINES ${draco_defines}
-    INCLUDES ${draco_include_paths}
-    LIB_DEPS ${draco_dependency})
 
-  draco_add_executable(
-    NAME draco_encoder
-    SOURCES "${draco_src_root}/tools/draco_encoder.cc" ${draco_io_sources}
-    DEFINES ${draco_defines}
-    INCLUDES ${draco_include_paths}
-    LIB_DEPS ${draco_dependency})
+#  draco_add_executable(
+#    NAME draco_decoder
+#    SOURCES "${draco_src_root}/tools/draco_decoder.cc" ${draco_io_sources}
+#    DEFINES ${draco_defines}
+#    INCLUDES ${draco_include_paths}
+#    LIB_DEPS ${draco_dependency})
+
+#  draco_add_executable(
+#    NAME draco_encoder
+#    SOURCES "${draco_src_root}/tools/draco_encoder.cc" ${draco_io_sources}
+#    DEFINES ${draco_defines}
+#    INCLUDES ${draco_include_paths}
+#    LIB_DEPS ${draco_dependency})
 
   if(DRACO_TRANSCODER_SUPPORTED)
     draco_add_executable(

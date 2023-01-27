@@ -488,6 +488,7 @@ class GltfAsset {
   Status EncodeTopLevelExtensionsProperty(EncoderBuffer *buf_out);
   Status EncodeLightsProperty(EncoderBuffer *buf_out);
   Status EncodeMaterialsVariantsNamesProperty(EncoderBuffer *buf_out);
+  Status EncodeCesiumRTCProperty(EncoderBuffer *buf_out);
   Status EncodeStructuralMetadataProperty(EncoderBuffer *buf_out);
   bool EncodeAccessorsProperty(EncoderBuffer *buf_out);
   bool EncodeBufferViewsProperty(EncoderBuffer *buf_out);
@@ -625,6 +626,8 @@ class GltfAsset {
   // We need to store them here to ensure their content doesn't get deleted
   // before it is used by the encoder.
   std::vector<std::unique_ptr<Mesh>> local_meshes_;
+
+  std::vector<double> cesiumRtc;
 };
 
 int GltfAsset::UnsignedIntComponentSize(unsigned int max_value) {
@@ -1483,6 +1486,13 @@ Status GltfAsset::AddScene(const Scene &scene) {
   DRACO_RETURN_IF_ERROR(AddMaterialsVariantsNames(scene));
   DRACO_RETURN_IF_ERROR(AddInstanceArrays(scene));
   AddStructuralMetadata(scene);
+
+  // Cesium RTC
+  if (!scene.cesiumRtc.empty()){
+    cesiumRtc = scene.cesiumRtc;
+    extensions_used_.insert("CESIUM_RTC");
+  }
+
   return OkStatus();
 }
 
@@ -2918,7 +2928,7 @@ Status GltfAsset::EncodeSkinsProperty(EncoderBuffer *buf_out) {
 Status GltfAsset::EncodeTopLevelExtensionsProperty(EncoderBuffer *buf_out) {
   // Return if there are no top-level asset extensions to encode.
   if (lights_.empty() && materials_variants_names_.empty() &&
-      property_tables_.empty()) {
+      property_tables_.empty() && cesiumRtc.empty()) {
     return OkStatus();
   }
 
@@ -2927,6 +2937,8 @@ Status GltfAsset::EncodeTopLevelExtensionsProperty(EncoderBuffer *buf_out) {
   DRACO_RETURN_IF_ERROR(EncodeLightsProperty(buf_out));
   DRACO_RETURN_IF_ERROR(EncodeMaterialsVariantsNamesProperty(buf_out));
   DRACO_RETURN_IF_ERROR(EncodeStructuralMetadataProperty(buf_out));
+  DRACO_RETURN_IF_ERROR(EncodeCesiumRTCProperty(buf_out));
+
   gltf_json_.EndObject();  // extensions entry.
   return OkStatus();
 }
@@ -2999,6 +3011,21 @@ Status GltfAsset::EncodeMaterialsVariantsNamesProperty(EncoderBuffer *buf_out) {
   }
   gltf_json_.EndArray();
   gltf_json_.EndObject();  // KHR_materials_variants entry.
+  return OkStatus();
+}
+
+Status GltfAsset::EncodeCesiumRTCProperty(EncoderBuffer *buf_out) {
+  if (cesiumRtc.empty()) {
+    return OkStatus();
+  }
+
+  gltf_json_.BeginObject("CESIUM_RTC");
+  gltf_json_.BeginArray("center");
+  for (const double &val : cesiumRtc) {
+    gltf_json_.OutputValue(val);
+  }
+  gltf_json_.EndArray();
+  gltf_json_.EndObject();
   return OkStatus();
 }
 

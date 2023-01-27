@@ -221,6 +221,7 @@ class Scene {
     return instance_arrays_[index].get();
   }
 
+  std::vector<double> cesiumRtc;
  private:
   IndexTypeVector<MeshIndex, std::unique_ptr<Mesh>> meshes_;
   IndexTypeVector<MeshGroupIndex, std::unique_ptr<MeshGroup>> mesh_groups_;

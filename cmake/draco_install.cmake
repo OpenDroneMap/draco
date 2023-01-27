@@ -50,8 +50,8 @@ macro(draco_setup_install_target)
   install(FILES "${draco_build}/draco/draco_features.h"
           DESTINATION "${includes_path}/draco/")
 
-  install(TARGETS draco_decoder DESTINATION "${bin_path}")
-  install(TARGETS draco_encoder DESTINATION "${bin_path}")
+#  install(TARGETS draco_decoder DESTINATION "${bin_path}")
+#  install(TARGETS draco_encoder DESTINATION "${bin_path}")
 
   if(DRACO_TRANSCODER_SUPPORTED)
     install(TARGETS draco_transcoder DESTINATION "${bin_path}")
