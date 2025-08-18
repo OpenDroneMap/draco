@@ -18,8 +18,7 @@
 #include "draco/draco_features.h"
 
 #ifdef DRACO_TRANSCODER_SUPPORTED
-#include <Eigen/Geometry>
-
+#include "Eigen/Geometry"
 #include "draco/core/status_or.h"
 
 namespace draco {
@@ -40,9 +39,10 @@ class TrsMatrix {
 
   void Copy(const TrsMatrix &tm);
 
-  void SetMatrix(const Eigen::Matrix4d &matrix) {
+  TrsMatrix &SetMatrix(const Eigen::Matrix4d &matrix) {
     matrix_ = matrix;
     matrix_set_ = true;
+    return *this;
   }
   bool MatrixSet() const { return matrix_set_; }
   StatusOr<const Eigen::Matrix4d> Matrix() const {
@@ -52,9 +52,10 @@ class TrsMatrix {
     return matrix_;
   }
 
-  void SetTranslation(const Eigen::Vector3d &translation) {
+  TrsMatrix &SetTranslation(const Eigen::Vector3d &translation) {
     translation_ = translation;
     translation_set_ = true;
+    return *this;
   }
   bool TranslationSet() const { return translation_set_; }
   StatusOr<const Eigen::Vector3d> Translation() const {
@@ -64,9 +65,10 @@ class TrsMatrix {
     return translation_;
   }
 
-  void SetRotation(const Eigen::Quaterniond &rotation) {
+  TrsMatrix &SetRotation(const Eigen::Quaterniond &rotation) {
     rotation_ = rotation;
     rotation_set_ = true;
+    return *this;
   }
   bool RotationSet() const { return rotation_set_; }
   StatusOr<const Eigen::Quaterniond> Rotation() const {
@@ -76,9 +78,10 @@ class TrsMatrix {
     return rotation_;
   }
 
-  void SetScale(const Eigen::Vector3d &scale) {
+  TrsMatrix &SetScale(const Eigen::Vector3d &scale) {
     scale_ = scale;
     scale_set_ = true;
+    return *this;
   }
   bool ScaleSet() const { return scale_set_; }
   StatusOr<const Eigen::Vector3d> Scale() const {

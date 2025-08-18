@@ -18,8 +18,7 @@
 #include "draco/draco_features.h"
 
 #ifdef DRACO_TRANSCODER_SUPPORTED
-#include <Eigen/Geometry>
-
+#include "Eigen/Geometry"
 #include "draco/core/status_or.h"
 #include "draco/mesh/mesh.h"
 
@@ -42,6 +41,9 @@ class MeshUtils {
   // feature textures, the textures must be owned by the |mesh| otherwise an
   // error is returned.
   static Status RemoveUnusedMeshFeatures(Mesh *mesh);
+
+  // Removes unused property attributes indices from |mesh|.
+  static Status RemoveUnusedPropertyAttributesIndices(Mesh *mesh);
 
   // Flips the UV values of |att|.
   static bool FlipTextureUvValues(bool flip_u, bool flip_v,

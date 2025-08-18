@@ -14,16 +14,22 @@
 //
 #include "draco/compression/expert_encode.h"
 
+#include <iostream>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <utility>
+
 #include "draco/compression/mesh/mesh_edgebreaker_encoder.h"
 #include "draco/compression/mesh/mesh_sequential_encoder.h"
 #ifdef DRACO_POINT_CLOUD_COMPRESSION_SUPPORTED
 #include "draco/compression/point_cloud/point_cloud_kd_tree_encoder.h"
 #include "draco/compression/point_cloud/point_cloud_sequential_encoder.h"
 #endif
+
 #ifdef DRACO_TRANSCODER_SUPPORTED
 #include "draco/core/bit_utils.h"
 #endif
-
 namespace draco {
 
 ExpertEncoder::ExpertEncoder(const PointCloud &point_cloud)
@@ -45,6 +51,11 @@ Status ExpertEncoder::EncodeToBuffer(EncoderBuffer *out_buffer) {
 Status ExpertEncoder::EncodePointCloudToBuffer(const PointCloud &pc,
                                                EncoderBuffer *out_buffer) {
 #ifdef DRACO_POINT_CLOUD_COMPRESSION_SUPPORTED
+#ifdef DRACO_TRANSCODER_SUPPORTED
+  // Apply DracoCompressionOptions associated with the point cloud.
+  DRACO_RETURN_IF_ERROR(ApplyCompressionOptions(pc));
+#endif  // DRACO_TRANSCODER_SUPPORTED
+
   std::unique_ptr<PointCloudEncoder> encoder;
   const int encoding_method = options().GetGlobalInt("encoding_method", -1);
 
@@ -107,7 +118,7 @@ Status ExpertEncoder::EncodeMeshToBuffer(const Mesh &m,
 #ifdef DRACO_TRANSCODER_SUPPORTED
   // Apply DracoCompressionOptions associated with the mesh.
   DRACO_RETURN_IF_ERROR(ApplyCompressionOptions(m));
-#endif
+#endif  // DRACO_TRANSCODER_SUPPORTED
 
   std::unique_ptr<MeshEncoder> encoder;
   // Select the encoding method only based on the provided options.
@@ -126,6 +137,7 @@ Status ExpertEncoder::EncodeMeshToBuffer(const Mesh &m,
     encoder = std::unique_ptr<MeshEncoder>(new MeshSequentialEncoder());
   }
   encoder->SetMesh(m);
+
   DRACO_RETURN_IF_ERROR(encoder->Encode(options(), out_buffer));
 
   set_num_encoded_points(encoder->num_encoded_points());
@@ -188,11 +200,11 @@ Status ExpertEncoder::SetAttributePredictionScheme(
 }
 
 #ifdef DRACO_TRANSCODER_SUPPORTED
-Status ExpertEncoder::ApplyCompressionOptions(const Mesh &mesh) {
-  if (!mesh.IsCompressionEnabled()) {
+Status ExpertEncoder::ApplyCompressionOptions(const PointCloud &pc) {
+  if (!pc.IsCompressionEnabled()) {
     return OkStatus();
   }
-  const auto &compression_options = mesh.GetCompressionOptions();
+  const auto &compression_options = pc.GetCompressionOptions();
 
   // Set any encoder options that haven't been explicitly set by users (don't
   // override existing options).
@@ -201,12 +213,12 @@ Status ExpertEncoder::ApplyCompressionOptions(const Mesh &mesh) {
                        10 - compression_options.compression_level);
   }
 
-  for (int ai = 0; ai < mesh.num_attributes(); ++ai) {
+  for (int ai = 0; ai < pc.num_attributes(); ++ai) {
     if (options().IsAttributeOptionSet(ai, "quantization_bits")) {
       continue;  // Don't override options that have been set.
     }
     int quantization_bits = 0;
-    const auto type = mesh.attribute(ai)->attribute_type();
+    const auto type = pc.attribute(ai)->attribute_type();
     switch (type) {
       case GeometryAttribute::POSITION:
         if (compression_options.quantization_position
@@ -214,7 +226,7 @@ Status ExpertEncoder::ApplyCompressionOptions(const Mesh &mesh) {
           quantization_bits =
               compression_options.quantization_position.quantization_bits();
         } else {
-          DRACO_RETURN_IF_ERROR(ApplyGridQuantization(mesh, ai));
+          DRACO_RETURN_IF_ERROR(ApplyGridQuantization(pc, ai));
         }
         break;
       case GeometryAttribute::TEX_COORD:
@@ -245,17 +257,29 @@ Status ExpertEncoder::ApplyCompressionOptions(const Mesh &mesh) {
   return OkStatus();
 }
 
-Status ExpertEncoder::ApplyGridQuantization(const Mesh &mesh,
+Status ExpertEncoder::ApplyGridQuantization(const PointCloud &pc,
                                             int attribute_index) {
-  const auto compression_options = mesh.GetCompressionOptions();
-  if (mesh.attribute(attribute_index)->num_components() != 3) {
+  const auto compression_options = pc.GetCompressionOptions();
+  const float spacing = compression_options.quantization_position.spacing();
+  return SetAttributeGridQuantization(pc, attribute_index, spacing);
+}
+
+Status ExpertEncoder::SetAttributeGridQuantization(const PointCloud &pc,
+                                                   int attribute_index,
+                                                   float spacing) {
+  const auto *const att = pc.attribute(attribute_index);
+  if (att->attribute_type() != GeometryAttribute::POSITION) {
+    return ErrorStatus(
+        "Invalid attribute type: Grid quantization is currently supported only "
+        "for positions.");
+  }
+  if (att->num_components() != 3) {
     return ErrorStatus(
         "Invalid number of components: Grid quantization is currently "
         "supported only for 3D positions.");
   }
-  const float spacing = compression_options.quantization_position.spacing();
   // Compute quantization properties based on the grid spacing.
-  const auto &bbox = mesh.ComputeBoundingBox();
+  const auto &bbox = pc.ComputeBoundingBox();
   // Snap min and max points of the |bbox| to the quantization grid vertices.
   Vector3f min_pos;
   int num_values = 0;  // Number of values that we need to encode.
@@ -282,7 +306,8 @@ Status ExpertEncoder::ApplyGridQuantization(const Mesh &mesh,
     bits++;
   }
   // Compute the range in mesh coordinates that matches the quantization bits.
-  const float range = (1 << bits) * spacing;
+  // Note there are n-1 intervals between the |n| quantization values.
+  const float range = ((1 << bits) - 1) * spacing;
   SetAttributeExplicitQuantization(attribute_index, bits, 3, min_pos.data(),
                                    range);
   return OkStatus();

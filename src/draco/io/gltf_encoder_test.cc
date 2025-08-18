@@ -15,10 +15,15 @@
 #include "draco/io/gltf_encoder.h"
 
 #ifdef DRACO_TRANSCODER_SUPPORTED
+#include <array>
+#include <iostream>
+#include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "draco/core/draco_test_base.h"
 #include "draco/core/draco_test_utils.h"
@@ -197,6 +202,9 @@ class GltfEncoderTest : public ::testing::Test {
       ASSERT_EQ(scene0->GetMaterialLibrary().GetMaterialsVariantName(i),
                 scene1->GetMaterialLibrary().GetMaterialsVariantName(i));
     }
+
+    // Check that Cesium RTC values are the same.
+    ASSERT_EQ(scene0->GetCesiumRtc(), scene1->GetCesiumRtc());
 
     // Check Nodes are the same.
     for (draco::SceneNodeIndex i(0); i < scene0->NumNodes(); ++i) {
@@ -619,6 +627,15 @@ TEST_F(GltfEncoderTest, EncodeSceneWithNodeNames) {
   EncodeSceneToGltfAndCompare(scene.get());
 }
 
+// Tests encoding a simple glTF with Cesium RTC.
+TEST_F(GltfEncoderTest, EncodeWithCesiumRtc) {
+  const std::string file_name = "Box/glTF/Box.gltf";
+  const std::unique_ptr<Scene> scene(DecodeTestGltfFileToScene(file_name));
+  ASSERT_NE(scene, nullptr);
+  scene->SetCesiumRtc(std::vector<double>({123.4, -234.5, -45678.9}));
+  EncodeSceneToGltfAndCompare(scene.get());
+}
+
 // Tests encoding a simple glTF with Draco compression.
 TEST_F(GltfEncoderTest, EncodeWithDracoCompression) {
   const std::string file_name = "Box/glTF/Box.gltf";
@@ -851,6 +868,66 @@ TEST_F(GltfEncoderTest, TestQuantizationPerAttribute) {
   const size_t tangent_quantization_bin_size =
       draco::GetFileSize(gltf_bin_filename);
   ASSERT_LT(tangent_quantization_bin_size, tex_coord_quantization_bin_size);
+}
+
+// Tests encoding a glTF with multiple scaled instances with Draco compression
+// using grid options for position quantization.
+TEST_F(GltfEncoderTest, TestDracoCompressionWithGridOptions) {
+  const std::string file_name =
+      "SpheresScaledInstances/glTF/spheres_scaled_instances.gltf";
+  std::unique_ptr<Scene> scene(DecodeTestGltfFileToScene(file_name));
+  ASSERT_NE(scene, nullptr);
+
+  const auto bbox = scene->GetMesh(MeshIndex(0)).ComputeBoundingBox();
+  const float mesh_size = bbox.Size().MaxCoeff();
+
+  // All dimensions of the original mesh are between [-1, 1]. Let's move the
+  // mesh to [0, 2] which will allow us to match grid quantization with the
+  // regular quantization (grid quantization is always aligned with 0).
+  Mesh &mesh = scene->GetMesh(MeshIndex(0));
+  PointAttribute *pos_att =
+      mesh.attribute(mesh.GetNamedAttributeId(GeometryAttribute::POSITION));
+  for (AttributeValueIndex avi(0); avi < pos_att->size(); ++avi) {
+    Vector3f pos;
+    pos_att->GetValue(avi, &pos[0]);
+    pos += Vector3f(1.f, 1.f, 1.f);
+    pos_att->SetAttributeValue(avi, &pos[0]);
+  }
+
+  DracoCompressionOptions options;
+
+  // First quantize the scene with 8 bits and save the result.
+  options.quantization_position.SetQuantizationBits(8);
+  SceneUtils::SetDracoCompressionOptions(&options, scene.get());
+
+  const std::string gltf_filename = draco::GetTestTempFileFullPath("temp.glb");
+  GltfEncoder encoder;
+  DRACO_ASSERT_OK(encoder.EncodeFile(*scene, gltf_filename));
+  // Get the size of the generated file.
+  const size_t qb_file_size = draco::GetFileSize(gltf_filename);
+
+  // Now set grid quantization and ensure the encoded file size is about the
+  // same. The max instance scale is 3 and model size is |mesh_size| so the grid
+  // scale must account for that.
+  options.quantization_position.SetGrid(mesh_size * 3. / 255.);
+  SceneUtils::SetDracoCompressionOptions(&options, scene.get());
+
+  DRACO_ASSERT_OK(encoder.EncodeFile(*scene, gltf_filename));
+  // Get the size of the generated file.
+  const size_t grid_file_size = draco::GetFileSize(gltf_filename);
+
+  ASSERT_EQ(grid_file_size, qb_file_size);
+
+  // Now set grid quantization to different settings and ensure the encoded size
+  // changed. We reduce spacing which should increase the size.
+  options.quantization_position.SetGrid(mesh_size * 3. / 511.);
+  SceneUtils::SetDracoCompressionOptions(&options, scene.get());
+
+  DRACO_ASSERT_OK(encoder.EncodeFile(*scene, gltf_filename));
+
+  // Get the size of the generated file.
+  const size_t grid_file_size_2 = draco::GetFileSize(gltf_filename);
+  ASSERT_GT(grid_file_size_2, grid_file_size);
 }
 
 TEST_F(GltfEncoderTest, TestOutputType) {
@@ -1218,7 +1295,7 @@ TEST_F(GltfEncoderTest, PbrNextExtensions) {
   const std::string tmp_name = draco::GetTestTempFileFullPath("tmp.gltf");
   DRACO_ASSERT_OK(encoder.EncodeFile<Scene>(*original, tmp_name));
 
-  // Read model from the temporay file.
+  // Read model from the temporary file.
   GltfDecoder decoder;
   DRACO_ASSIGN_OR_ASSERT(auto encoded, decoder.DecodeFromFileToScene(tmp_name));
   ASSERT_NE(encoded, nullptr);
@@ -1423,6 +1500,44 @@ TEST_F(GltfEncoderTest, EncodeToBuffer) {
   ASSERT_EQ(std::memcmp(file_data.data(), buffer.data(), buffer.size()), 0);
 }
 
+TEST_F(GltfEncoderTest, CopyrightAssetIsEncoded) {
+  // Load scene from file.
+  const std::string file_name = "CesiumMilkTruck/glTF/CesiumMilkTruck.gltf";
+  const std::unique_ptr<Scene> scene = ReadSceneFromTestFile(file_name);
+  ASSERT_NE(scene, nullptr);
+
+  std::array<std::pair<std::string, std::string>, 3> test_cases = {
+      {{"Google", "Google"}, {"", ""}, {"GMaps", ""}}};
+
+  for (const std::pair<std::string, std::string> &test_case : test_cases) {
+    // Encode scene to buffer in GLB format.
+    GltfEncoder encoder;
+    encoder.set_copyright(test_case.first);
+    EncoderBuffer buffer;
+    DRACO_ASSERT_OK(encoder.EncodeToBuffer(*scene, &buffer));
+    ASSERT_NE(buffer.size(), 0);
+
+    const std::string glb_file_path =
+        draco::GetTestTempFileFullPath(test_case.first + "temp.glb");
+    std::string folder_path;
+    std::string glb_file_name;
+    draco::SplitPath(glb_file_path, &folder_path, &glb_file_name);
+    encoder.set_copyright(test_case.second);
+    encoder.EncodeToFile<Scene>(*scene, glb_file_path, folder_path);
+
+    std::vector<char> file_data;
+    ASSERT_TRUE(ReadFileToBuffer(glb_file_path, &file_data));
+    if (test_case.first == test_case.second) {
+      ASSERT_EQ(buffer.size(), draco::GetFileSize(glb_file_path))
+          << glb_file_path;
+      ASSERT_EQ(std::memcmp(file_data.data(), buffer.data(), buffer.size()), 0);
+    } else {
+      ASSERT_NE(buffer.size(), draco::GetFileSize(glb_file_path))
+          << glb_file_path;
+    }
+  }
+}
+
 // Tests that a scene with lights can be encoded into a file.
 TEST_F(GltfEncoderTest, EncodeLights) {
   const std::string file_name = "sphere_lights.gltf";
@@ -1505,9 +1620,9 @@ TEST_F(GltfEncoderTest, EncodeMaterialsVariants) {
 // structural metadata property table.
 TEST_F(GltfEncoderTest, EncodeSceneWithMeshFeaturesWithStructuralMetadata) {
   const std::string file_name = "BoxMeta/glTF/BoxMeta.gltf";
-  constexpr bool kHasMeshFeatures = true;
-  constexpr bool kHasStructuralMetadata = true;
-  constexpr bool kHasDracoCompression = false;
+  GltfTestHelper::UseCase use_case;
+  use_case.has_mesh_features = true;
+  use_case.has_structural_metadata = true;
 
   // Read test file from file.
   const std::unique_ptr<Scene> scene(DecodeTestGltfFileToScene(file_name));
@@ -1517,18 +1632,17 @@ TEST_F(GltfEncoderTest, EncodeSceneWithMeshFeaturesWithStructuralMetadata) {
   std::unique_ptr<Scene> scene_from_gltf;
   SceneToDecodedGltfScene(*scene, &scene_from_gltf);
   ASSERT_NE(scene_from_gltf, nullptr);
-  GltfTestHelper::CheckBoxMetaMeshFeatures(*scene_from_gltf,
-                                           kHasDracoCompression);
-  GltfTestHelper::CheckBoxMetaStructuralMetadata(*scene_from_gltf);
+  GltfTestHelper::CheckBoxMetaMeshFeatures(*scene_from_gltf, use_case);
+  GltfTestHelper::CheckBoxMetaStructuralMetadata(*scene_from_gltf, use_case);
 }
 
 // Tests encoding of draco::Scene with Draco compression to glTF with various
 // mesh feature ID sets.
 TEST_F(GltfEncoderTest, EncodeSceneWithMeshFeaturesWithDracoCompression) {
   const std::string file_name = "BoxMetaDraco/glTF/BoxMetaDraco.gltf";
-  constexpr bool kHasMeshFeatures = true;
-  constexpr bool kHasStructuralMetadata = false;
-  constexpr bool kHasDracoCompression = true;
+  GltfTestHelper::UseCase use_case;
+  use_case.has_draco_compression = true;
+  use_case.has_mesh_features = true;
 
   // Read test file from file.
   const std::unique_ptr<Scene> scene(DecodeTestGltfFileToScene(file_name));
@@ -1538,15 +1652,16 @@ TEST_F(GltfEncoderTest, EncodeSceneWithMeshFeaturesWithDracoCompression) {
   std::unique_ptr<Scene> scene_from_gltf;
   SceneToDecodedGltfScene(*scene, &scene_from_gltf);
   ASSERT_NE(scene_from_gltf, nullptr);
-  GltfTestHelper::CheckBoxMetaMeshFeatures(*scene_from_gltf,
-                                           kHasDracoCompression);
+  GltfTestHelper::CheckBoxMetaMeshFeatures(*scene_from_gltf, use_case);
 }
 
 // Tests encoding of draco::Mesh to glTF with various mesh feature ID sets and
 // structural metadata property table.
 TEST_F(GltfEncoderTest, EncodeMeshWithMeshFeaturesWithStructuralMetadata) {
   const std::string file_name = "BoxMeta/glTF/BoxMeta.gltf";
-  constexpr bool kHasDracoCompression = false;
+  GltfTestHelper::UseCase use_case;
+  use_case.has_mesh_features = true;
+  use_case.has_structural_metadata = true;
 
   // Read test file from file.
   const std::unique_ptr<Mesh> mesh(ReadMeshFromTestFile(file_name));
@@ -1556,16 +1671,17 @@ TEST_F(GltfEncoderTest, EncodeMeshWithMeshFeaturesWithStructuralMetadata) {
   std::unique_ptr<Mesh> mesh_from_gltf;
   MeshToDecodedGltfMesh(*mesh, &mesh_from_gltf);
   ASSERT_NE(mesh_from_gltf, nullptr);
-  GltfTestHelper::CheckBoxMetaMeshFeatures(*mesh_from_gltf,
-                                           kHasDracoCompression);
-  GltfTestHelper::CheckBoxMetaStructuralMetadata(*mesh_from_gltf);
+  GltfTestHelper::CheckBoxMetaMeshFeatures(*mesh_from_gltf, use_case);
+  GltfTestHelper::CheckBoxMetaStructuralMetadata(*mesh_from_gltf, use_case);
 }
 
 // Tests encoding of draco::Mesh with Draco compression to glTF with various
 // mesh feature ID sets.
 TEST_F(GltfEncoderTest, EncodeMeshWithMeshFeaturesWithDracoCompression) {
-  constexpr bool kHasDracoCompression = true;
   const std::string file_name = "BoxMetaDraco/glTF/BoxMetaDraco.gltf";
+  GltfTestHelper::UseCase use_case;
+  use_case.has_draco_compression = true;
+  use_case.has_mesh_features = true;
 
   // Read test file from file.
   const std::unique_ptr<Mesh> mesh(ReadMeshFromTestFile(file_name));
@@ -1575,8 +1691,37 @@ TEST_F(GltfEncoderTest, EncodeMeshWithMeshFeaturesWithDracoCompression) {
   std::unique_ptr<Mesh> mesh_from_gltf;
   MeshToDecodedGltfMesh(*mesh, &mesh_from_gltf);
   ASSERT_NE(mesh_from_gltf, nullptr);
-  GltfTestHelper::CheckBoxMetaMeshFeatures(*mesh_from_gltf,
-                                           kHasDracoCompression);
+  GltfTestHelper::CheckBoxMetaMeshFeatures(*mesh_from_gltf, use_case);
+}
+
+// This test verifies that b/245519530 is fixed. It loads mesh with various mesh
+// feature ID sets, enables Draco compression, converts mesh to scene, and
+// encodes the scene to glTF.
+TEST_F(GltfEncoderTest, EncodeMeshWithMeshFeaturesWithDracoCompressionAsScene) {
+  // Note that although the mesh is loaded from file with no Draco compression,
+  // the compression is enabled later on.
+  const std::string file_name = "BoxMeta/glTF/BoxMeta.gltf";
+  GltfTestHelper::UseCase use_case;
+  use_case.has_draco_compression = true;
+  use_case.has_mesh_features = true;
+  use_case.has_structural_metadata = true;
+
+  // Read test file from file.
+  std::unique_ptr<Mesh> mesh(ReadMeshFromTestFile(file_name));
+  ASSERT_NE(mesh, nullptr);
+
+  // Enable Draco compression.
+  mesh->SetCompressionEnabled(use_case.has_draco_compression);
+
+  // Convert mesh to scene.
+  std::unique_ptr<Scene> scene =
+      draco::SceneUtils::MeshToScene(std::move(mesh)).value();
+
+  // Encode the scene to glTF and decode it back to draco::Scene and check.
+  std::unique_ptr<Scene> scene_from_gltf;
+  SceneToDecodedGltfScene(*scene, &scene_from_gltf);
+  ASSERT_NE(scene_from_gltf, nullptr);
+  GltfTestHelper::CheckBoxMetaMeshFeatures(*scene_from_gltf, use_case);
 }
 
 // Tests encoding of draco::Mesh with mesh features associated with different
@@ -1626,6 +1771,49 @@ TEST_F(GltfEncoderTest, EncodeMeshWithMeshFeaturesWithMultiplePrimitives) {
 
   // All mesh features should share two textures.
   ASSERT_EQ(scene_from_gltf->GetNonMaterialTextureLibrary().NumTextures(), 2);
+}
+
+// Tests encoding of draco::Mesh with property attributes associated with
+// different mesh primitives.
+TEST_F(GltfEncoderTest,
+       EncodeMeshWithPropertyAttributesWithMultiplePrimitives) {
+  const std::string file_name = "BoxesMeta/glTF/BoxesMeta.gltf";
+
+  // Read test file from file.
+  const std::unique_ptr<Mesh> mesh(ReadMeshFromTestFile(file_name));
+  ASSERT_NE(mesh, nullptr);
+  ASSERT_EQ(mesh->NumPropertyAttributesIndices(), 2);
+
+  // Encode the scene to glTF and decode it back to draco::Mesh and check.
+  std::unique_ptr<Mesh> mesh_from_gltf;
+  MeshToDecodedGltfMesh(*mesh, &mesh_from_gltf);
+  ASSERT_NE(mesh_from_gltf, nullptr);
+
+  ASSERT_EQ(mesh_from_gltf->GetMaterialLibrary().NumMaterials(), 2);
+  ASSERT_EQ(mesh_from_gltf->NumPropertyAttributesIndices(), 2);
+
+  // First property attribute should be used by material 0 and the second by
+  // material 1.
+  ASSERT_EQ(mesh_from_gltf->NumPropertyAttributesIndexMaterialMasks(0), 1);
+  ASSERT_EQ(mesh_from_gltf->NumPropertyAttributesIndexMaterialMasks(1), 1);
+  ASSERT_EQ(mesh_from_gltf->GetPropertyAttributesIndexMaterialMask(0, 0), 0);
+  ASSERT_EQ(mesh_from_gltf->GetPropertyAttributesIndexMaterialMask(1, 0), 1);
+
+  // Ensure it still works correctly when we re-encode the source |mesh| as a
+  // scene.
+  std::unique_ptr<Scene> scene_from_gltf;
+  MeshToDecodedGltfScene(*mesh, &scene_from_gltf);
+  ASSERT_NE(scene_from_gltf, nullptr);
+
+  ASSERT_EQ(scene_from_gltf->NumMeshes(), 2);
+
+  // Both meshes should have one property attributes indices.
+  ASSERT_EQ(scene_from_gltf->GetMesh(draco::MeshIndex(0))
+                .NumPropertyAttributesIndices(),
+            1);
+  ASSERT_EQ(scene_from_gltf->GetMesh(draco::MeshIndex(1))
+                .NumPropertyAttributesIndices(),
+            1);
 }
 
 // Tests encoding of draco::Mesh containing a point cloud and two materials.

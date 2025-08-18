@@ -18,13 +18,19 @@
 #include <sys/types.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <functional>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "draco/attributes/geometry_attribute.h"
 #include "draco/attributes/point_attribute.h"
@@ -33,13 +39,16 @@
 #include "draco/core/draco_types.h"
 #include "draco/core/vector_d.h"
 #include "draco/io/file_utils.h"
+#include "draco/io/file_writer_utils.h"
 #include "draco/io/gltf_utils.h"
 #include "draco/io/texture_io.h"
 #include "draco/mesh/mesh_features.h"
 #include "draco/mesh/mesh_splitter.h"
 #include "draco/mesh/mesh_utils.h"
+#include "draco/metadata/property_attribute.h"
 #include "draco/scene/instance_array.h"
 #include "draco/scene/scene_indices.h"
+#include "draco/scene/scene_utils.h"
 #include "draco/texture/texture_utils.h"
 
 namespace draco {
@@ -82,22 +91,46 @@ int TextureAxisWrappingModeToGltfValue(TextureMap::AxisWrappingMode mode) {
   }
 }
 
-// Checks |att| metadata entry in |mesh| with key "attribute_name" and returns
-// entry value if it begins with "_FEATURE_ID_", or an empty string otherwise.
-std::string GetFeatureIdAttributeName(const PointAttribute &att,
-                                      const Mesh &mesh) {
-  const auto *const metadata =
-      mesh.GetAttributeMetadataByAttributeId(att.unique_id());
-  if (metadata) {
-    std::string attribute_name;
-    if (metadata->GetEntryString("attribute_name", &attribute_name)) {
-      constexpr char kPrefix[] = "_FEATURE_ID_";
-      if (attribute_name.rfind(kPrefix) == 0) {
-        return attribute_name;
+// Returns a boolean indicating whether |mesh| attribute at |att_index| is a
+// feature ID vertex attribute referred to by any of the feature ID sets stored
+// in the |mesh|.
+bool IsFeatureIdAttribute(int att_index, const Mesh &mesh) {
+  for (MeshFeaturesIndex i(0); i < mesh.NumMeshFeatures(); ++i) {
+    if (mesh.GetMeshFeatures(i).GetAttributeIndex() == att_index) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Returns a boolean indicating whether |mesh| attribute at |att_index| is a
+// property attribute referred to by the |mesh| and its |structural_metadata|.
+bool IsPropertyAttribute(int att_index, const Mesh &mesh,
+                         const StructuralMetadata &structural_metadata) {
+  // First check if structural metadata has any property attributes.
+  if (structural_metadata.NumPropertyAttributes() == 0) {
+    return false;
+  }
+
+  // Property attribute name must start with an underscore like _DIRECTION.
+  const std::string attribute_name = mesh.attribute(att_index)->name();
+  if (attribute_name.rfind('_', 0) != 0) {
+    return false;
+  }
+
+  // Look for an |attribute_name| among all property attributes in the |mesh|.
+  for (int i = 0; i < mesh.NumPropertyAttributesIndices(); ++i) {
+    const int property_attribute_index = mesh.GetPropertyAttributesIndex(i);
+    const PropertyAttribute &attribute =
+        structural_metadata.GetPropertyAttribute(property_attribute_index);
+    for (int i = 0; i < attribute.NumProperties(); ++i) {
+      const PropertyAttribute::Property &property = attribute.GetProperty(i);
+      if (property.GetAttributeName() == attribute_name) {
+        return true;
       }
     }
   }
-  return std::string();
+  return false;
 }
 
 // Struct to hold glTF Scene data.
@@ -115,7 +148,7 @@ struct GltfNode {
         root_node(false) {}
 
   std::string name;
-  std::vector<int> childern_indices;
+  std::vector<int> children_indices;
   int mesh_index;
   int skin_index;
   int light_index;
@@ -212,8 +245,13 @@ struct GltfPrimitive {
   int material;
   std::vector<MeshGroup::MaterialsVariantsMapping> material_variants_mappings;
   std::vector<const MeshFeatures *> mesh_features;
+  std::vector<int> property_attributes;
   std::map<std::string, int> attributes;
   GltfDracoCompressedMesh compressed_mesh_info;
+
+  // Map from the index of a feature ID vertex attribute in draco::Mesh to the
+  // index in the feature ID vertex attribute name like _FEATURE_ID_5.
+  std::unordered_map<int, int> feature_id_name_indices;
 };
 
 struct GltfMesh {
@@ -241,6 +279,8 @@ class GltfAsset {
 
   GltfAsset();
 
+  void set_copyright(const std::string &copyright) { copyright_ = copyright; }
+  std::string copyright() const { return copyright_; }
   std::string generator() const { return generator_; }
   std::string version() const { return version_; }
   std::string buffer_name() const { return buffer_name_; }
@@ -284,14 +324,17 @@ class GltfAsset {
 
   // Compresses |mesh| using Draco. On success returns the buffer_view in
   // |primitive| and number of encoded points and faces.
-  Status CompressMeshWithDraco(const Mesh &mesh, GltfPrimitive *primitive,
+  Status CompressMeshWithDraco(const Mesh &mesh,
+                               const Eigen::Matrix4d &transform,
+                               GltfPrimitive *primitive,
                                int64_t *num_encoded_points,
                                int64_t *num_encoded_faces);
 
   // Adds a Draco mesh associated with a material id and material variants.
   bool AddDracoMesh(const Mesh &mesh, int material_id,
                     const std::vector<MeshGroup::MaterialsVariantsMapping>
-                        &material_variants_mappings);
+                        &material_variants_mappings,
+                    const Eigen::Matrix4d &transform);
 
   // Add the Draco mesh indices to the glTF data. |num_encoded_faces| is the
   // number of faces encoded in |mesh|, which can be different than
@@ -340,13 +383,12 @@ class GltfAsset {
   int AddDracoJoints(const Mesh &mesh, int num_encoded_points);
   int AddDracoWeights(const Mesh &mesh, int num_encoded_points);
   std::vector<std::pair<std::string, int>> AddDracoGenerics(
-      const Mesh &mesh, int num_encoded_points);
+      const Mesh &mesh, int num_encoded_points,
+      std::unordered_map<int, int> *feature_id_name_indices);
 
   // Iterate through the materials that are associated with |mesh| and add them
-  // to the asset. Returns true if |mesh| does not contain any materials or all
-  // the materials are supported. Returns false if |mesh| contains materials
-  // that are not supported.
-  bool AddMaterials(const Mesh &mesh);
+  // to the asset.
+  void AddMaterials(const Mesh &mesh);
 
   // Checks whether a given Draco |attribute| has data of expected |data_type|
   // and whether the data has one of expected |num_components|. Returns true
@@ -384,10 +426,8 @@ class GltfAsset {
   Status AddSceneNode(const Scene &scene, SceneNodeIndex scene_node_index);
 
   // Iterate through the materials that are associated with |scene| and add them
-  // to the asset. Returns true if |scene| does not contain any materials or all
-  // the materials are supported. Returns false if |scene| contains materials
-  // that are not supported.
-  bool AddMaterials(const Scene &scene);
+  // to the asset.
+  void AddMaterials(const Scene &scene);
 
   // Iterate through the animations that are associated with |scene| and add
   // them to the asset. Returns OkStatus() if |scene| does not contain any
@@ -505,9 +545,26 @@ class GltfAsset {
     gltf_json_.EndArray();
   }
 
-  // Add a mesh Draco attribute |att| that is comprised of floats to the glTF
-  // data. Returns the index accessor added to the glTF data. Returns -1 on
-  // error.
+  // Add a mesh Draco attribute |att| to the glTF data. Returns the index
+  // accessor added to the glTF data. Returns -1 on error.
+  int AddAttribute(const PointAttribute &att, int num_points,
+                   int num_encoded_points, bool compress) {
+    const int nep = num_encoded_points;
+    switch (att.data_type()) {
+      case DT_UINT8:
+        return AddAttribute<uint8_t>(att, num_points, nep, compress);
+      case DT_UINT16:
+        return AddAttribute<uint16_t>(att, num_points, nep, compress);
+      case DT_FLOAT32:
+        return AddAttribute<float>(att, num_points, nep, compress);
+      default:
+        return -1;
+    }
+  }
+
+  // Add a mesh Draco attribute |att| that is comprised of |att_data_t| values
+  // to the glTF data. Returns the index accessor added to the glTF data.
+  // Returns -1 on error.
   template <class att_data_t>
   int AddAttribute(const PointAttribute &att, int num_points,
                    int num_encoded_points, bool compress) {
@@ -544,6 +601,10 @@ class GltfAsset {
                    int num_encoded_points, const std::string &type,
                    bool compress);
 
+  void SetCopyrightFromScene(const Scene &scene);
+  void SetCopyrightFromMesh(const Mesh &mesh);
+
+  std::string copyright_;
   std::string generator_;
   std::string version_;
   std::vector<GltfScene> scenes_;
@@ -571,6 +632,7 @@ class GltfAsset {
   // Keeps track if the glTF mesh has been added.
   std::map<MeshGroupIndex, int> mesh_group_index_to_gltf_mesh_;
   std::map<MeshIndex, std::pair<int, int>> mesh_index_to_gltf_mesh_primitive_;
+  IndexTypeVector<MeshIndex, Eigen::Matrix4d> base_mesh_transforms_;
 
   struct EncoderAnimation {
     std::string name;
@@ -598,14 +660,16 @@ class GltfAsset {
   std::vector<std::unique_ptr<Light>> lights_;
   std::vector<std::string> materials_variants_names_;
   std::vector<EncoderInstanceArray> instance_arrays_;
-  PropertyTable::Schema property_table_schema_;
-  std::vector<const PropertyTable *> property_tables_;
+  const StructuralMetadata *structural_metadata_;
 
   // Indicates whether Draco compression is used for any of the asset meshes.
   bool draco_compression_used_;
 
   // Indicates whether mesh features are used.
   bool mesh_features_used_;
+
+  // Indicates whether structural metadata is used.
+  bool structural_metadata_used_;
 
   // Counter for naming mesh feature textures.
   int mesh_features_texture_index_;
@@ -627,7 +691,7 @@ class GltfAsset {
   // before it is used by the encoder.
   std::vector<std::unique_ptr<Mesh>> local_meshes_;
 
-  std::vector<double> cesiumRtc;
+  std::vector<double> cesium_rtc_;
 };
 
 int GltfAsset::UnsignedIntComponentSize(unsigned int max_value) {
@@ -658,8 +722,10 @@ GltfAsset::GltfAsset()
       version_("2.0"),
       scene_index_(-1),
       buffer_name_("buffer0.bin"),
+      structural_metadata_(nullptr),
       draco_compression_used_(false),
       mesh_features_used_(false),
+      structural_metadata_used_(false),
       mesh_features_texture_index_(0),
       add_images_to_buffer_(false),
       output_type_(GltfEncoder::COMPACT) {}
@@ -669,19 +735,20 @@ bool GltfAsset::AddDracoMesh(const Mesh &mesh) {
   if (scene_index < 0) {
     return false;
   }
-  if (!AddMaterials(mesh)) {
-    return false;
-  }
+  AddMaterials(mesh);
 
   GltfMesh gltf_mesh;
   meshes_.push_back(gltf_mesh);
 
   AddStructuralMetadata(mesh);
+  if (copyright_.empty()) {
+    SetCopyrightFromMesh(mesh);
+  }
 
   const int32_t material_att_id =
       mesh.GetNamedAttributeId(GeometryAttribute::MATERIAL);
   if (material_att_id == -1) {
-    if (!AddDracoMesh(mesh, 0, {})) {
+    if (!AddDracoMesh(mesh, 0, {}, Eigen::Matrix4d::Identity())) {
       return false;
     }
   } else {
@@ -704,6 +771,10 @@ bool GltfAsset::AddDracoMesh(const Mesh &mesh) {
       // Copy over mesh features for a given material index.
       Mesh::CopyMeshFeaturesForMaterial(mesh, split_meshes[i].get(), mat_index);
 
+      // Copy over property attributes indices for a given material index.
+      Mesh::CopyPropertyAttributesIndicesForMaterial(
+          mesh, split_meshes[i].get(), mat_index);
+
       // Move the split mesh to a temporary storage of the GltfAsset. This will
       // ensure the mesh will stay alive as long the asset needs it. We have to
       // do this because the split mesh may contain mesh features data that are
@@ -712,7 +783,8 @@ bool GltfAsset::AddDracoMesh(const Mesh &mesh) {
 
       // The material index in the glTF file corresponds to the index of the
       // split mesh.
-      if (!AddDracoMesh(*(local_meshes_.back().get()), mat_index, {})) {
+      if (!AddDracoMesh(*(local_meshes_.back().get()), mat_index, {},
+                        Eigen::Matrix4d::Identity())) {
         return false;
       }
     }
@@ -809,12 +881,12 @@ void GltfAsset::AddAttributeToDracoExtension(
 }
 
 Status GltfAsset::CompressMeshWithDraco(const Mesh &mesh,
+                                        const Eigen::Matrix4d &transform,
                                         GltfPrimitive *primitive,
                                         int64_t *num_encoded_points,
                                         int64_t *num_encoded_faces) {
   // Check that geometry comression options are valid.
-  const DracoCompressionOptions &compression_options =
-      mesh.GetCompressionOptions();
+  DracoCompressionOptions compression_options = mesh.GetCompressionOptions();
   DRACO_RETURN_IF_ERROR(compression_options.Check());
 
   // Make a copy of the mesh. It will be modified and compressed.
@@ -837,12 +909,19 @@ Status GltfAsset::CompressMeshWithDraco(const Mesh &mesh,
 
   // Create Draco encoder.
   EncoderBuffer buffer;
-  ExpertEncoder encoder(*mesh_copy);
-  encoder.SetTrackEncodedProperties(true);
+  std::unique_ptr<ExpertEncoder> encoder;
+  if (mesh_copy->num_faces() > 0) {
+    // Encode mesh.
+    encoder.reset(new ExpertEncoder(*mesh_copy));
+  } else {
+    return Status(Status::DRACO_ERROR,
+                  "Draco compression is not supported for glTF point clouds.");
+  }
+  encoder->SetTrackEncodedProperties(true);
 
   // Convert compression level to speed (that 0 = slowest, 10 = fastest).
   const int speed = 10 - compression_options.compression_level;
-  encoder.SetSpeedOptions(speed, speed);
+  encoder->SetSpeedOptions(speed, speed);
 
   // Configure attribute quantization.
   for (int i = 0; i < mesh_copy->num_attributes(); ++i) {
@@ -850,9 +929,29 @@ Status GltfAsset::CompressMeshWithDraco(const Mesh &mesh,
     if (att->attribute_type() == GeometryAttribute::POSITION &&
         !compression_options.quantization_position
              .AreQuantizationBitsDefined()) {
-      // TODO(ostava): Handle grid option. This will be implemented in a
-      // separate CL.
-      return ErrorStatus("Grid quantization not implemented yet.");
+      // Desired spacing in the "global" coordinate system.
+      const float global_spacing =
+          compression_options.quantization_position.spacing();
+
+      // Note: Ideally we would transform the whole mesh before encoding and
+      // apply the original global spacing on the transformed mesh. But neither
+      // KHR_draco_mesh_compression, nor Draco bitstream support post-decoding
+      // transformations so we have to modify the grid settings here.
+
+      // Transform this spacing to the local coordinate system of the base mesh.
+      // We will get the largest scale factor from the transformation matrix and
+      // use it to adjust the grid spacing.
+      const Vector3f scale_vec(transform.col(0).norm(), transform.col(1).norm(),
+                               transform.col(2).norm());
+
+      const float max_scale = scale_vec.MaxCoeff();
+
+      // Spacing is inverse to the scale. The larger the scale, the smaller the
+      // spacing must be.
+      const float local_spacing = global_spacing / max_scale;
+
+      // Update the compression options of the processed mesh.
+      compression_options.quantization_position.SetGrid(local_spacing);
     } else {
       int num_quantization_bits = -1;
       switch (att->attribute_type()) {
@@ -874,19 +973,19 @@ Status GltfAsset::CompressMeshWithDraco(const Mesh &mesh,
           num_quantization_bits = compression_options.quantization_bits_weight;
           break;
         case GeometryAttribute::GENERIC:
-          if (GetFeatureIdAttributeName(*att, *mesh_copy).empty()) {
+          if (!IsFeatureIdAttribute(i, *mesh_copy)) {
             num_quantization_bits =
                 compression_options.quantization_bits_generic;
           } else {
             // Quantization is explicitly disabled for feature ID attributes.
-            encoder.SetAttributeQuantization(i, -1);
+            encoder->SetAttributeQuantization(i, -1);
           }
           break;
         default:
           break;
       }
       if (num_quantization_bits > 0) {
-        encoder.SetAttributeQuantization(i, num_quantization_bits);
+        encoder->SetAttributeQuantization(i, num_quantization_bits);
       }
     }
   }
@@ -914,9 +1013,16 @@ Status GltfAsset::CompressMeshWithDraco(const Mesh &mesh,
     }
   }
 
-  DRACO_RETURN_IF_ERROR(encoder.EncodeToBuffer(&buffer));
-  *num_encoded_points = encoder.num_encoded_points();
-  *num_encoded_faces = encoder.num_encoded_faces();
+  // |compression_options| may have been modified and we need to update them
+  // before we start the encoding.
+  mesh_copy->SetCompressionOptions(compression_options);
+  DRACO_RETURN_IF_ERROR(encoder->EncodeToBuffer(&buffer));
+  *num_encoded_points = encoder->num_encoded_points();
+  if (mesh_copy->num_faces() > 0) {
+    *num_encoded_faces = encoder->num_encoded_faces();
+  } else {
+    *num_encoded_faces = 0;
+  }
   const size_t buffer_start_offset = buffer_.size();
   if (!buffer_.Encode(buffer.data(), buffer.size())) {
     return Status(Status::DRACO_ERROR, "Could not copy Draco compressed data.");
@@ -984,13 +1090,14 @@ bool CheckAndGetTexCoordAttributeOrder(const Mesh &mesh,
 bool GltfAsset::AddDracoMesh(
     const Mesh &mesh, int material_id,
     const std::vector<MeshGroup::MaterialsVariantsMapping>
-        &material_variants_mappings) {
+        &material_variants_mappings,
+    const Eigen::Matrix4d &transform) {
   GltfPrimitive primitive;
   int64_t num_encoded_points = mesh.num_points();
   int64_t num_encoded_faces = mesh.num_faces();
   if (num_encoded_faces > 0 && mesh.IsCompressionEnabled()) {
     const Status status = CompressMeshWithDraco(
-        mesh, &primitive, &num_encoded_points, &num_encoded_faces);
+        mesh, transform, &primitive, &num_encoded_points, &num_encoded_faces);
     if (!status.ok()) {
       return false;
     }
@@ -1022,7 +1129,8 @@ bool GltfAsset::AddDracoMesh(
   const int joints_accessor_index = AddDracoJoints(mesh, num_encoded_points);
   const int weights_accessor_index = AddDracoWeights(mesh, num_encoded_points);
   const std::vector<std::pair<std::string, int>> generics_accessors =
-      AddDracoGenerics(mesh, num_encoded_points);
+      AddDracoGenerics(mesh, num_encoded_points,
+                       &primitive.feature_id_name_indices);
 
   if (num_encoded_faces == 0) {
     primitive.mode = 0;  // POINTS mode.
@@ -1032,6 +1140,10 @@ bool GltfAsset::AddDracoMesh(
   primitive.mesh_features.reserve(mesh.NumMeshFeatures());
   for (MeshFeaturesIndex i(0); i < mesh.NumMeshFeatures(); ++i) {
     primitive.mesh_features.push_back(&mesh.GetMeshFeatures(i));
+  }
+  primitive.property_attributes.reserve(mesh.NumPropertyAttributesIndices());
+  for (int i = 0; i < mesh.NumPropertyAttributesIndices(); ++i) {
+    primitive.property_attributes.push_back(mesh.GetPropertyAttributesIndex(i));
   }
   primitive.indices = indices_index;
   primitive.attributes.insert(
@@ -1171,9 +1283,12 @@ int GltfAsset::AddDracoNormals(const Mesh &mesh, int num_encoded_points) {
 int GltfAsset::AddDracoColors(const Mesh &mesh, int num_encoded_points) {
   const PointAttribute *const att =
       mesh.GetNamedAttribute(GeometryAttribute::COLOR);
-  // TODO(b/200302561): Add support for DT_UINT16 with COLOR.
-  if (!CheckDracoAttribute(att, {DT_UINT8, DT_FLOAT32}, {3, 4})) {
+  if (!CheckDracoAttribute(att, {DT_UINT8, DT_UINT16, DT_FLOAT32}, {3, 4})) {
     return -1;
+  }
+  if (att->data_type() == DT_UINT16) {
+    return AddAttribute<uint16_t>(*att, mesh.num_points(), num_encoded_points,
+                                  mesh.IsCompressionEnabled());
   }
   if (att->data_type() == DT_FLOAT32) {
     return AddAttribute<float>(*att, mesh.num_points(), num_encoded_points,
@@ -1278,73 +1393,77 @@ int GltfAsset::AddDracoWeights(const Mesh &mesh, int num_encoded_points) {
                              mesh.IsCompressionEnabled());
 }
 
-// Adds generic attributes that have metadata describing the attribute name.
-// This allows for export of application-specific attributes and feature ID
-// attributes defined in glTF extension EXT_mesh_features. Returns a vector of
-// attribute-name, accessor pairs for each valid attribute. The length of the
-// vector is equal to the number of generic attributes. Vector entries
-// corresponding to unsupported attributes (e.g., with no metadata) contain
-// empty attribute names.
+// Adds generic attributes that have metadata describing the attribute name,
+// attributes referred to by one of the mesh feature ID sets or in the |mesh|,
+// and attributes referred to by one of the property attributes in the |mesh|.
+// This allows for export of application-specific attributes, feature ID
+// attributes defined in glTF extension EXT_mesh_features, and property
+// attributes defined in glTF extension EXT_structural_metadata. Returns a
+// vector of attribute-name, accessor pairs for each valid attribute. Populates
+// map from |mesh| attribute index in the feature ID attribute name like
+// _FEATURE_ID_5 or _DIRECTION for each feature ID and property attribute in the
+// |mesh|.
 std::vector<std::pair<std::string, int>> GltfAsset::AddDracoGenerics(
-    const Mesh &mesh, int num_encoded_points) {
-  const int num_attributes =
+    const Mesh &mesh, int num_encoded_points,
+    std::unordered_map<int, int> *feature_id_name_indices) {
+  const int num_generic_attributes =
       mesh.NumNamedAttributes(GeometryAttribute::GENERIC);
-  std::vector<std::pair<std::string, int>> attrs(num_attributes);
-  for (int i = 0; i < num_attributes; ++i) {
-    const PointAttribute *const att =
-        mesh.GetNamedAttribute(GeometryAttribute::GENERIC, i);
-    auto const *metadata =
-        mesh.GetAttributeMetadataByAttributeId(att->unique_id());
+  std::vector<std::pair<std::string, int>> attrs;
+  int feature_id_count = 0;
+  for (int i = 0; i < num_generic_attributes; ++i) {
+    const int att_index =
+        mesh.GetNamedAttributeId(GeometryAttribute::GENERIC, i);
+    const PointAttribute *const att = mesh.attribute(att_index);
+    std::string attr_name;
+    int accessor = -1;
+
+    auto const *metadata = mesh.GetAttributeMetadataByAttributeId(att_index);
     if (metadata) {
-      std::string attr_name;
       if (metadata->GetEntryString(GltfEncoder::kDracoMetadataGltfAttributeName,
                                    &attr_name)) {
         if (att->data_type() == DT_FLOAT32) {
-          int accessor =
+          accessor =
               AddAttribute<float>(*att, mesh.num_points(), num_encoded_points,
                                   mesh.IsCompressionEnabled());
-          attrs[i] = {attr_name, accessor};
-        }
-      } else {
-        // Try to find feature ID attribute name like "_FEATURE_ID_5" then check
-        // that the attribute stores scalar values of complient data types as
-        // defined by the EXT_mesh_features glTF extension.
-        attr_name = GetFeatureIdAttributeName(*att, mesh);
-        if (!attr_name.empty() && att->num_components() == 1) {
-          int accessor = -1;
-          switch (att->data_type()) {
-            case DT_UINT8:
-              accessor = AddAttribute<uint8_t>(*att, mesh.num_points(),
-                                               num_encoded_points,
-                                               mesh.IsCompressionEnabled());
-              break;
-            case DT_UINT16:
-              accessor = AddAttribute<uint16_t>(*att, mesh.num_points(),
-                                                num_encoded_points,
-                                                mesh.IsCompressionEnabled());
-              break;
-            case DT_FLOAT32:
-              accessor = AddAttribute<float>(*att, mesh.num_points(),
-                                             num_encoded_points,
-                                             mesh.IsCompressionEnabled());
-              break;
-            default:
-              continue;
-          }
-          attrs[i] = {attr_name, accessor};
         }
       }
+    } else {
+      if (IsFeatureIdAttribute(att_index, mesh) && att->num_components() == 1) {
+        // This is an attribute referred to by one of the mesh feature ID sets
+        // as defined by the EXT_mesh_features glTF extension.
+        // TODO(vytyaz): Report an error if the number of components is not one.
+        accessor = AddAttribute(*att, mesh.num_points(), num_encoded_points,
+                                mesh.IsCompressionEnabled());
+
+        // Generate attribute name like _FEATURE_ID_N where N starts at 0 for
+        // the first feature ID vertex attribute and continues with consecutive
+        // positive integers as dictated by the EXT_mesh_features extension.
+        attr_name =
+            std::string("_FEATURE_ID_") + std::to_string(feature_id_count);
+
+        // Populate map from attribute index in the |mesh| to the index in a
+        // feature ID vertex attribute name like _FEATURE_ID_5.
+        (*feature_id_name_indices)[att_index] = feature_id_count;
+        feature_id_count++;
+      } else if (IsPropertyAttribute(att_index, mesh, *structural_metadata_)) {
+        // This is a property attribute as defined by the
+        // EXT_structural_metadata glTF extension.
+        accessor = AddAttribute(*att, mesh.num_points(), num_encoded_points,
+                                mesh.IsCompressionEnabled());
+        attr_name = att->name();
+      }
+    }
+    if (accessor != -1 && !attr_name.empty()) {
+      attrs.emplace_back(attr_name, accessor);
     }
   }
   return attrs;
 }
 
-bool GltfAsset::AddMaterials(const Mesh &mesh) {
-  if (mesh.GetMaterialLibrary().NumMaterials() == 0) {
-    return true;
+void GltfAsset::AddMaterials(const Mesh &mesh) {
+  if (mesh.GetMaterialLibrary().NumMaterials()) {
+    material_library_.Copy(mesh.GetMaterialLibrary());
   }
-  material_library_.Copy(mesh.GetMaterialLibrary());
-  return true;
 }
 
 bool GltfAsset::CheckDracoAttribute(const PointAttribute *attribute,
@@ -1388,19 +1507,17 @@ StatusOr<int> GltfAsset::AddImage(const std::string &image_stem,
     }
     return it->second;
   }
-  const std::string extension = TextureUtils::GetTargetExtension(*texture);
+  std::string extension = TextureUtils::GetTargetExtension(*texture);
+  if (extension.empty()) {
+    // Try to get extension from the source file name.
+    extension = LowercaseFileExtension(texture->source_image().filename());
+  }
   GltfImage image;
   image.image_name = image_stem + "." + extension;
   image.texture = texture;
   image.owned_texture = std::move(owned_texture);
   image.num_components = num_components;
-
-  // Always maintain the mime_type. Used elsewhere to determine image type.
-  if (extension == "jpg") {
-    image.mime_type = "image/jpeg";
-  } else {
-    image.mime_type = "image/" + extension;
-  }
+  image.mime_type = TextureUtils::GetTargetMimeType(*texture);
 
   // For KTX2 with Basis compression, state that its extension is required.
   if (extension == "ktx2") {
@@ -1470,9 +1587,12 @@ Status GltfAsset::AddScene(const Scene &scene) {
   if (scene_index < 0) {
     return Status(Status::DRACO_ERROR, "Error creating a new scene.");
   }
-  if (!AddMaterials(scene)) {
-    return Status(Status::DRACO_ERROR, "Error adding materials to the scene.");
-  }
+  AddMaterials(scene);
+  AddStructuralMetadata(scene);
+
+  // Initialize base mesh transforms that may be needed when the base meshes are
+  // compressed with Draco.
+  base_mesh_transforms_ = SceneUtils::FindLargestBaseMeshTransforms(scene);
   for (SceneNodeIndex i(0); i < scene.NumNodes(); ++i) {
     DRACO_RETURN_IF_ERROR(AddSceneNode(scene, i));
   }
@@ -1485,11 +1605,13 @@ Status GltfAsset::AddScene(const Scene &scene) {
   DRACO_RETURN_IF_ERROR(AddLights(scene));
   DRACO_RETURN_IF_ERROR(AddMaterialsVariantsNames(scene));
   DRACO_RETURN_IF_ERROR(AddInstanceArrays(scene));
-  AddStructuralMetadata(scene);
+  if (copyright_.empty()) {
+    SetCopyrightFromScene(scene);
+  }
 
   // Cesium RTC
-  if (!scene.cesiumRtc.empty()){
-    cesiumRtc = scene.cesiumRtc;
+  cesium_rtc_ = scene.GetCesiumRtc();
+  if (!cesium_rtc_.empty()) {
     extensions_used_.insert("CESIUM_RTC");
   }
 
@@ -1508,7 +1630,7 @@ Status GltfAsset::AddSceneNode(const Scene &scene,
   node.trs_matrix.Copy(scene_node->GetTrsMatrix());
 
   for (int i = 0; i < scene_node->NumChildren(); ++i) {
-    node.childern_indices.push_back(scene_node->Child(i).value());
+    node.children_indices.push_back(scene_node->Child(i).value());
   }
 
   const MeshGroupIndex mesh_group_index = scene_node->GetMeshGroupIndex();
@@ -1531,7 +1653,8 @@ Status GltfAsset::AddSceneNode(const Scene &scene,
           // We have not added the mesh to the scene yet.
           const Mesh &mesh = scene.GetMesh(instance.mesh_index);
           if (!AddDracoMesh(mesh, instance.material_index,
-                            instance.materials_variants_mappings)) {
+                            instance.materials_variants_mappings,
+                            base_mesh_transforms_[instance.mesh_index])) {
             return Status(Status::DRACO_ERROR, "Adding a Draco mesh failed.");
           }
           const int gltf_mesh_index = meshes_.size() - 1;
@@ -1554,6 +1677,12 @@ Status GltfAsset::AddSceneNode(const Scene &scene,
           for (MeshFeaturesIndex j(0); j < mesh.NumMeshFeatures(); ++j) {
             primitive.mesh_features.push_back(&mesh.GetMeshFeatures(j));
           }
+          primitive.property_attributes.reserve(
+              mesh.NumPropertyAttributesIndices());
+          for (int i = 0; i < mesh.NumPropertyAttributesIndices(); ++i) {
+            primitive.property_attributes.push_back(
+                mesh.GetPropertyAttributesIndex(i));
+          }
           meshes_.back().primitives.push_back(primitive);
         }
       }
@@ -1569,12 +1698,10 @@ Status GltfAsset::AddSceneNode(const Scene &scene,
   return OkStatus();
 }
 
-bool GltfAsset::AddMaterials(const Scene &scene) {
-  if (scene.GetMaterialLibrary().NumMaterials() == 0) {
-    return true;
+void GltfAsset::AddMaterials(const Scene &scene) {
+  if (scene.GetMaterialLibrary().NumMaterials()) {
+    material_library_.Copy(scene.GetMaterialLibrary());
   }
-  material_library_.Copy(scene.GetMaterialLibrary());
-  return true;
 }
 
 Status GltfAsset::AddAnimations(const Scene &scene) {
@@ -1849,14 +1976,7 @@ Status GltfAsset::AddInstanceArrays(const Scene &scene) {
 
 template <typename GeometryT>
 void GltfAsset::AddStructuralMetadata(const GeometryT &geometry) {
-  const StructuralMetadata &structural_metadata =
-      geometry.GetStructuralMetadata();
-  if (!structural_metadata.GetPropertyTableSchema().Empty()) {
-    property_table_schema_ = structural_metadata.GetPropertyTableSchema();
-    for (int i = 0; i < structural_metadata.NumPropertyTables(); ++i) {
-      property_tables_.push_back(&structural_metadata.GetPropertyTable(i));
-    }
-  }
+  structural_metadata_ = &geometry.GetStructuralMetadata();
 }
 
 StatusOr<int> GltfAsset::AddData(const std::vector<float> &data,
@@ -1937,6 +2057,9 @@ bool GltfAsset::EncodeAssetProperty(EncoderBuffer *buf_out) {
   gltf_json_.BeginObject("asset");
   gltf_json_.OutputValue("version", version_);
   gltf_json_.OutputValue("generator", generator_);
+  if (!copyright_.empty()) {
+    gltf_json_.OutputValue("copyright", copyright_);
+  }
   gltf_json_.EndObject();
 
   const std::string asset_str = gltf_json_.MoveData();
@@ -2009,10 +2132,10 @@ bool GltfAsset::EncodeNodesProperty(EncoderBuffer *buf_out) {
       gltf_json_.EndObject();
     }
 
-    if (!nodes_[i].childern_indices.empty()) {
+    if (!nodes_[i].children_indices.empty()) {
       gltf_json_.BeginArray("children");
-      for (int j = 0; j < nodes_[i].childern_indices.size(); ++j) {
-        gltf_json_.OutputValue(nodes_[i].childern_indices[j]);
+      for (int j = 0; j < nodes_[i].children_indices.size(); ++j) {
+        gltf_json_.OutputValue(nodes_[i].children_indices[j]);
       }
       gltf_json_.EndArray();
     }
@@ -2135,9 +2258,10 @@ Status GltfAsset::EncodePrimitiveExtensionsProperty(
       primitive.compressed_mesh_info.buffer_view_index >= 0;
   const bool has_materials_variants =
       !primitive.material_variants_mappings.empty();
+  const bool has_structural_metadata = !primitive.property_attributes.empty();
   const bool has_mesh_features = !primitive.mesh_features.empty();
   if (!has_draco_mesh_compression && !has_materials_variants &&
-      !has_mesh_features) {
+      !has_mesh_features && !has_structural_metadata) {
     return OkStatus();
   }
 
@@ -2181,7 +2305,10 @@ Status GltfAsset::EncodePrimitiveExtensionsProperty(
       }
       gltf_json_.OutputValue("featureCount", features->GetFeatureCount());
       if (features->GetAttributeIndex() != -1) {
-        gltf_json_.OutputValue("attribute", features->GetAttributeIndex());
+        // Index referring to mesh feature ID attribute name like _FEATURE_ID_5.
+        const int index =
+            primitive.feature_id_name_indices.at(features->GetAttributeIndex());
+        gltf_json_.OutputValue("attribute", index);
       }
       if (features->GetPropertyTableIndex() != -1) {
         gltf_json_.OutputValue("propertyTable",
@@ -2214,6 +2341,16 @@ Status GltfAsset::EncodePrimitiveExtensionsProperty(
     }
     gltf_json_.EndArray();   // featureIds array.
     gltf_json_.EndObject();  // EXT_mesh_features entry.
+  }
+  if (has_structural_metadata) {
+    structural_metadata_used_ = true;
+    gltf_json_.BeginObject("EXT_structural_metadata");
+    gltf_json_.BeginArray("propertyAttributes");
+    for (const int property_attribute_index : primitive.property_attributes) {
+      gltf_json_.OutputValue(property_attribute_index);
+    }
+    gltf_json_.EndArray();   // propertyAttributes array.
+    gltf_json_.EndObject();  // EXT_structural_metadata entry.
   }
   gltf_json_.EndObject();  // extensions entry.
   return OkStatus();
@@ -2928,7 +3065,9 @@ Status GltfAsset::EncodeSkinsProperty(EncoderBuffer *buf_out) {
 Status GltfAsset::EncodeTopLevelExtensionsProperty(EncoderBuffer *buf_out) {
   // Return if there are no top-level asset extensions to encode.
   if (lights_.empty() && materials_variants_names_.empty() &&
-      property_tables_.empty() && cesiumRtc.empty()) {
+      structural_metadata_->NumPropertyTables() == 0 &&
+      structural_metadata_->NumPropertyAttributes() == 0 &&
+      cesium_rtc_.empty()) {
     return OkStatus();
   }
 
@@ -2938,7 +3077,6 @@ Status GltfAsset::EncodeTopLevelExtensionsProperty(EncoderBuffer *buf_out) {
   DRACO_RETURN_IF_ERROR(EncodeMaterialsVariantsNamesProperty(buf_out));
   DRACO_RETURN_IF_ERROR(EncodeStructuralMetadataProperty(buf_out));
   DRACO_RETURN_IF_ERROR(EncodeCesiumRTCProperty(buf_out));
-
   gltf_json_.EndObject();  // extensions entry.
   return OkStatus();
 }
@@ -3015,13 +3153,13 @@ Status GltfAsset::EncodeMaterialsVariantsNamesProperty(EncoderBuffer *buf_out) {
 }
 
 Status GltfAsset::EncodeCesiumRTCProperty(EncoderBuffer *buf_out) {
-  if (cesiumRtc.empty()) {
+  if (cesium_rtc_.empty()) {
     return OkStatus();
   }
 
   gltf_json_.BeginObject("CESIUM_RTC");
   gltf_json_.BeginArray("center");
-  for (const double &val : cesiumRtc) {
+  for (const double &val : cesium_rtc_) {
     gltf_json_.OutputValue(val);
   }
   gltf_json_.EndArray();
@@ -3030,38 +3168,39 @@ Status GltfAsset::EncodeCesiumRTCProperty(EncoderBuffer *buf_out) {
 }
 
 Status GltfAsset::EncodeStructuralMetadataProperty(EncoderBuffer *buf_out) {
-  if (property_table_schema_.Empty()) {
+  if (structural_metadata_->GetSchema().Empty()) {
     return OkStatus();
   }
 
+  structural_metadata_used_ = true;
   gltf_json_.BeginObject("EXT_structural_metadata");
 
-  // Encodes property table schema.
+  // Encodes structural metadata schema.
   struct SchemaWriter {
-    static void Write(const PropertyTable::Schema::Object &object,
-                      JsonWriter *json_writer) {
+    typedef StructuralMetadataSchema::Object Object;
+    static void Write(const Object &object, JsonWriter *json_writer) {
       switch (object.GetType()) {
-        case PropertyTable::Schema::Object::OBJECT:
+        case Object::OBJECT:
           json_writer->BeginObject(object.GetName());
-          for (const PropertyTable::Schema::Object &obj : object.GetObjects()) {
+          for (const Object &obj : object.GetObjects()) {
             Write(obj, json_writer);
           }
           json_writer->EndObject();
           break;
-        case PropertyTable::Schema::Object::ARRAY:
+        case Object::ARRAY:
           json_writer->BeginArray(object.GetName());
-          for (const PropertyTable::Schema::Object &obj : object.GetArray()) {
+          for (const Object &obj : object.GetArray()) {
             Write(obj, json_writer);
           }
           json_writer->EndArray();
           break;
-        case PropertyTable::Schema::Object::STRING:
+        case Object::STRING:
           json_writer->OutputValue(object.GetName(), object.GetString());
           break;
-        case PropertyTable::Schema::Object::INTEGER:
+        case Object::INTEGER:
           json_writer->OutputValue(object.GetName(), object.GetInteger());
           break;
-        case PropertyTable::Schema::Object::BOOLEAN:
+        case Object::BOOLEAN:
           json_writer->OutputValue(object.GetName(), object.GetBoolean());
           break;
       }
@@ -3069,11 +3208,13 @@ Status GltfAsset::EncodeStructuralMetadataProperty(EncoderBuffer *buf_out) {
   };
 
   // Encode property table schema.
-  SchemaWriter::Write(property_table_schema_.json, &gltf_json_);
+  SchemaWriter::Write(structural_metadata_->GetSchema().json, &gltf_json_);
 
   // Encode all property tables.
   gltf_json_.BeginArray("propertyTables");
-  for (const PropertyTable *const table : property_tables_) {
+  for (int i = 0; i < structural_metadata_->NumPropertyTables(); i++) {
+    const PropertyTable *const table =
+        &structural_metadata_->GetPropertyTable(i);
     gltf_json_.BeginObject();
     if (!table->GetName().empty()) {
       gltf_json_.OutputValue("name", table->GetName());
@@ -3120,7 +3261,33 @@ Status GltfAsset::EncodeStructuralMetadataProperty(EncoderBuffer *buf_out) {
     gltf_json_.EndObject();  // properties entry.
     gltf_json_.EndObject();
   }
-  gltf_json_.EndArray();   // propertyTables entry.
+  gltf_json_.EndArray();  // propertyTables entry.
+
+  // Encode all property attributes.
+  gltf_json_.BeginArray("propertyAttributes");
+  for (int i = 0; i < structural_metadata_->NumPropertyAttributes(); i++) {
+    const PropertyAttribute *const attribute =
+        &structural_metadata_->GetPropertyAttribute(i);
+    gltf_json_.BeginObject();
+    if (!attribute->GetName().empty()) {
+      gltf_json_.OutputValue("name", attribute->GetName());
+    }
+    if (!attribute->GetClass().empty()) {
+      gltf_json_.OutputValue("class", attribute->GetClass());
+    }
+
+    // Encoder all property attribute properties.
+    gltf_json_.BeginObject("properties");
+    for (int i = 0; i < attribute->NumProperties(); ++i) {
+      const PropertyAttribute::Property &property = attribute->GetProperty(i);
+      gltf_json_.BeginObject(property.GetName());
+      gltf_json_.OutputValue("attribute", property.GetAttributeName());
+      gltf_json_.EndObject();  // Named property entry.
+    }
+    gltf_json_.EndObject();  // properties entry.
+    gltf_json_.EndObject();
+  }
+  gltf_json_.EndArray();   // propertyAttributes entry.
   gltf_json_.EndObject();  // EXT_structural_metadata entry.
   return OkStatus();
 }
@@ -3228,7 +3395,7 @@ Status GltfAsset::EncodeExtensionsProperties(EncoderBuffer *buf_out) {
   if (mesh_features_used_) {
     extensions_used_.insert("EXT_mesh_features");
   }
-  if (!property_table_schema_.Empty()) {
+  if (structural_metadata_used_) {
     extensions_used_.insert("EXT_structural_metadata");
   }
 
@@ -3365,6 +3532,20 @@ int GltfAsset::AddAttribute(const PointAttribute &att, int num_points,
   return static_cast<int>(accessors_.size() - 1);
 }
 
+void GltfAsset::SetCopyrightFromScene(const Scene &scene) {
+  std::string copyright;
+  scene.GetMetadata().GetEntryString("copyright", &copyright);
+  set_copyright(copyright);
+}
+
+void GltfAsset::SetCopyrightFromMesh(const Mesh &mesh) {
+  if (mesh.GetMetadata() != nullptr) {
+    std::string copyright;
+    mesh.GetMetadata()->GetEntryString("copyright", &copyright);
+    set_copyright(copyright);
+  }
+}
+
 const char GltfEncoder::kDracoMetadataGltfAttributeName[] =
     "//GLTF/ApplicationSpecificAttributeName";
 
@@ -3418,6 +3599,7 @@ Status GltfEncoder::EncodeFile(const T &geometry, const std::string &filename,
   }
 
   GltfAsset gltf_asset;
+  gltf_asset.set_copyright(copyright_);
   gltf_asset.set_output_type(output_type_);
 
   if (extension == "gltf") {
@@ -3438,7 +3620,6 @@ Status GltfEncoder::EncodeFile(const T &geometry, const std::string &filename,
   }
   return WriteGltfFiles(gltf_asset, buffer, filename, bin_filename,
                         resource_dir);
-  return OkStatus();
 }
 
 template <typename T>
@@ -3448,6 +3629,7 @@ Status GltfEncoder::EncodeToBuffer(const T &geometry,
   gltf_asset.set_output_type(output_type_);
   gltf_asset.buffer_name("");
   gltf_asset.set_add_images_to_buffer(true);
+  gltf_asset.set_copyright(copyright_);
 
   // Encode the geometry into a buffer.
   EncoderBuffer buffer;
